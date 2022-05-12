@@ -145,10 +145,8 @@ def eval(trainer:DecoderTrainer, val_dl, device, cond_scale=1.0):
         image_embed = clip.embed_image(image).image_embed
         samples = trainer.sample(image_embed, text=text, cond_scale=cond_scale)
         sample = tensor2grid(samples)
-        # wandb visualize
-        wandb.log({"sample": wandb.Image(sample)})
         break
-        
+    return sample
     
 def train(trainer:DecoderTrainer, train_dl, val_dl, cfg, device):
     # set Logger
@@ -202,7 +200,9 @@ def train(trainer:DecoderTrainer, train_dl, val_dl, cfg, device):
             # eval time - sample
             if step > 0 and step % cfg.eval_interval == 0:
                 print_ribbon('Evaluating')
-                eval(trainer, val_dl, device, cond_scale=cfg.cond_scale)
+                sample = eval(trainer, val_dl, device, cond_scale=cfg.cond_scale)
+                # wandb visualize
+                wandb.log({"sample": wandb.Image(sample)}, step=step)
             
             #save checkpoint every save_interval minutes
             if (int(time.time() - t) >= cfg.save_interval * 60):
