@@ -192,7 +192,7 @@ class MMTSVEmbed_Dataset(MMTSVDataset):
         import clip 
         openai_clip, preprocess = clip.load(clip_name, 'cpu')
         self.clip = openai_clip
-        self.clip_normalize = preprocess.transforms[-1]
+        self.preprocess = preprocess
         self.tokenizer_func = clip.tokenize
         super().__init__(**kwargs)
         
@@ -212,18 +212,18 @@ class MMTSVEmbed_Dataset(MMTSVDataset):
             row = self.tsv.seek(index)
             img = self.read_img(row)
 
-        if self.image_transforms:
+        if self.preprocess:
+            img = self.preprocess(img)
+        elif self.image_transforms:
             img = self.image_transforms(img)
 
         text = self.read_label(row)[self.infokey]
-        
-        # embed text
         text = self.tokenizer_func(text)
-        text_embed = self.clip.encode_text(text).squeeze(0)
         
-        # embed image
-        image = resize_image_to(img, self.image_size)
-        image = self.clip_normalize(unnomalize_img(image))
-        image_embed = self.clip.encode_image(image.unsqueeze(0)).squeeze(0)
+        with torch.no_grad():
+            # embed text
+            text_embed = self.clip.encode_text(text).squeeze(0)
+            # embed image
+            image_embed = self.clip.encode_image(image.unsqueeze(0)).squeeze(0)
     
         return l2norm(image_embed).float(), l2norm(text_embed).float()

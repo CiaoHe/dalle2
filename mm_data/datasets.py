@@ -20,6 +20,7 @@ import enum
 
 from torchvision import transforms
 from mm_data.mm_tsv_dataset import MMTSVDataset, MMTSVEmbed_Dataset
+from mm_data.load_clip import load_clip
 
 # CC 3M
 CC_3M_TSV = '/comp_robot/cv_public_dataset/ConceptualCaptions/train.tsv'
@@ -106,6 +107,7 @@ BGRDatasets = [
 def get_dataset(dataset:str,
                 split:str,
                 image_transforms=[dict(type='ToTensor')],
+                preprocess_clip_way = False,
                 ):
     dataset = dataset_map[dataset]
     lineidx_file = None  # By default the same prefix as dataset tsv file.
@@ -118,7 +120,21 @@ def get_dataset(dataset:str,
     
     tsv_file = dataset.value
     map_color = dataset in BGRDatasets
-    dataset = MMTSVDataset(tsv_file=tsv_file, lineidx_file=lineidx_file, map_color=map_color, image_transforms=image_transforms, key='text')
+    
+    tokenizer = None
+    image_transforms = None
+    if preprocess_clip_way:
+        _, image_transforms = load_clip()
+        import clip
+        tokenizer = lambda text: clip.tokenize([text], truncate=True)[0]
+        
+    dataset = MMTSVDataset(
+        tsv_file=tsv_file, 
+        lineidx_file=lineidx_file, 
+        map_color=map_color, 
+        image_transforms=image_transforms,
+        label_transforms=tokenizer, 
+        key='text')
     return dataset, tsv_file
 
 def get_embed_dataset(dataset:str,

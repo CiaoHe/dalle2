@@ -1,6 +1,7 @@
 **ckpt/
 **wandb*/
 *_checkpoints/
+scripts/
 
 *.slurm
 *.sh
