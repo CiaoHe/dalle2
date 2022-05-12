@@ -1,0 +1,11 @@
+**ckpt/
+**wandb*/
+*_checkpoints/
+
+*.slurm
+*.sh
+**.ipynb
+
+__pycache__/
+
+mm_data/data_sample/

@@ -1,0 +1,36 @@
+Unets:
+  Unet1:
+    dim: 128
+    image_embed_dim: 512
+    text_embed_dim: 512
+    cond_dim: 128
+    channels: 3
+    dim_mults: [1, 2, 4, 8]
+  
+  Unet2:
+    dim: 16
+    image_embed_dim: 512
+    text_embed_dim: 512
+    cond_dim: 128
+    channels: 3
+    dim_mults: [1, 2, 4, 8, 16]
+    cond_on_text_encodings: True
+
+Decoder:
+  image_sizes: [128, 256]
+  timesteps: 1000
+  image_cond_drop_prob: 0.1
+  text_cond_drop_prob: 0.5
+  condition_on_text_encodings: True
+  # loss
+  loss_type: 'l1'
+  # diff
+  beta_schedule: 'cosine'
+  predict_x_start: False
+  predict_x_start_for_latent_diffusion: False # not to latent now
+  lowres_downsample_first: True
+  # blur
+  blur_sigma: 0.1
+  blur_kernel_size: 3
+  clip_denoised: True
+  clip_x_start: True
