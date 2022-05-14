@@ -304,11 +304,14 @@ def main():
         unets = []
         for unet_name in mconfig.Unets:
             unets.append(Unet(**mconfig.Unets[unet_name]).to(device))
+<<<<<<< HEAD
         unets = tuple(unets)
+=======
+>>>>>>> e8c8225 (fix train_decoder wandb config)
         
         # init decoder
         decoder = Decoder(
-            unet = unets,
+            unet = tuple(unets),
             clip = clip,
             **mconfig.Decoder
         ).to(device)
