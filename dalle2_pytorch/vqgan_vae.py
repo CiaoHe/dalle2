@@ -218,7 +218,7 @@ class ResNetEncDec(nn.Module):
         dim,
         *,
         channels=3,
-        layers=4,
+        layers=4,                 # each layer serves for upsample / downsample
         layer_mults=None,
         num_resnet_blocks=1,
         resnet_groups=16,
@@ -619,6 +619,7 @@ class VQGanVAE(nn.Module):
         layer_dims = [dim * m for m in layer_mults]
         dims = [dim] + layer_dims
         
+        # add Discriminator as Criticor
         self.discr = Discriminator(dims=dims, channels=channels)
         
         self.discr_loss = hinge_disc_loss if use_hinge_loss else bce_discr_loss

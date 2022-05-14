@@ -110,7 +110,7 @@ def resize_image_to(image, target_image_size):
 def normalize_img(img):
     return (img - 0.5) * 2
 
-def unnomalize_img(img):
+def unnomarlize_img(img):
     return img / 2 + 0.5
 
 # clip related adapters
@@ -269,7 +269,7 @@ class OpenAIClipAdapter(BaseClipAdapter):
     def embed_image(self, image):
         assert not self.cleared, 'image embedding should be called before text embedding'
         image = resize_image_to(image, self.image_size)
-        image = self.clip_normalize(unnomalize_img(image))
+        image = self.clip_normalize(unnomarlize_img(image))
         image_embed = self.clip.encode_image(image)
         return EmbeddedImage(l2norm(image_embed.float()), None)
     
@@ -1411,6 +1411,7 @@ class Unet(nn.Module):
         
         # mask out image embedding depending on condition dropout
         # for classifier free guidance
+        # (And) Image_tokens here suppiles to condtional generation
         image_tokens = None
         
         if self.cond_on_image_embeds:
@@ -1509,6 +1510,18 @@ class LowresConditioner(nn.Module):
         blur_sigma = None,
         blur_kernel_size = None
     ):
+        """LowresConditioner Forward
+
+        Args:
+            cond_fmap (Tensor): The Image to condition on.
+            target_image_size (_type_): _description_
+            downsample_image_size (_type_, optional): _description_. Defaults to None.
+            blur_sigma (_type_, optional): _description_. Defaults to None.
+            blur_kernel_size (_type_, optional): _description_. Defaults to None.
+
+        Returns:
+            _type_: _description_
+        """
         if self.training and self.downsample_first and exists(downsample_image_size):
             cond_fmap = resize_image_to(cond_fmap, downsample_image_size)
             
@@ -1585,13 +1598,13 @@ class Decoder(BaseGaussianDiffusion):
         self.vaes = nn.ModuleList([])
         
         for ind, (one_unet, one_vae) in enumerate(zip(unets, vaes)):
-            assert isinstance(one_unet, Unet)
-            assert isinstance(one_vae, (NullVQGanVAE, VQGanVAE))
+            assert isinstance(one_unet, Unet), f"unet must be an Unet, not {type(one_unet)}"
+            assert isinstance(one_vae, (NullVQGanVAE, VQGanVAE)), f"vae must be a VQGanVAE(or NullOne), not {type(one_vae)}"
             
             is_first = ind == 0
             latent_dim = one_vae.encoded_dim if exists(one_vae) else None
             
-            unet_channels = default(latent_dim, self.channels)
+            unet_channels = default(latent_dim, self.channels) # if use latent_diffusion(vae), cast channels to laetent_dim
             
             one_unet = one_unet.cast_model_parameters(
                 lowres_cond = not is_first,
@@ -1765,6 +1778,7 @@ class Decoder(BaseGaussianDiffusion):
             self.predict_x_start
         )):
             unet: Unet
+            vae: Optional(VQGanVAE, NullVQGanVAE)
             context = self.one_unet_in_gpu(unet = unet) if image_embed.is_cuda else null_context()
             
             with context:
@@ -1772,10 +1786,11 @@ class Decoder(BaseGaussianDiffusion):
                 shape = (batch_size, channel, image_size, image_size)
                 
                 if unet.lowres_cond:
+                    # The first UNet has no-lowres to condition, skip thie step
                     lowres_cond_img = self.to_lowres_cond(img, target_image_size = image_size)
                 
                 is_latent_diffusion = isinstance(vae, VQGanVAE)
-                image_size = vae.get_encoded_fmap_size(image_size)
+                image_size = vae.get_encoded_fmap_size(image_size) # Downsampled image by vae-encoder
                 shape = (batch_size, vae.encoded_dim, image_size, image_size)
                 
                 if exists(lowres_cond_img):

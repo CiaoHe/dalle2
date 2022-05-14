@@ -39,11 +39,12 @@ def resize_image_to(image, target_image_size):
     return resize(image, scale_factors = scale_factors)
 
 @torch.no_grad()
-def tensor2grid(tensor, normalize=True):
+def tensor2grid(tensor, unnormalize=True):
     """
     Convert a tensor into a grid of images.
+        unormalize: if True, will unormalize the image from (-1,1)->(0,1)
     """
-    if normalize:
+    if unnormalize:
         tensor = tensor / 2 + 0.5
     tensor = (tensor * 255).to(torch.uint8)
     sample = make_grid(tensor, nrow=int(math.sqrt(tensor.shape[0]))).cpu().numpy()
@@ -118,7 +119,7 @@ def load_decoder_model(path, device, load_clip=False, clip=None):
 
 def save_decoder_model(save_path, decoder:Decoder, clip, hparams, step):
     # avoid save decoder's clip
-    if not exists(clip):
+    if exists(decoder.clip):
         del decoder.clip
     # Saving State Dict
     print_ribbon('Saving checkpoint')
@@ -161,7 +162,7 @@ def train(trainer:DecoderTrainer, train_dl, val_dl, cfg, device):
             'max_gradient_clipping_norm': cfg.max_gradient_clipping_norm,
             'batch_size': cfg.batch_size,
             'num_epochs': cfg.epochs,
-        },
+        }.update(**cfg.mconfig),
         dir = cfg.wandb_dir,
     )
     
@@ -296,12 +297,13 @@ def main():
                                         load_clip=not args.clip == "openai_clip", clip=clip)
     else:
         # init unets
-        unet1 = Unet(**mconfig.Unets.Unet1).to(device)
-        unet2 = Unet(**mconfig.Unets.Unet2).to(device)
+        unets = ()
+        for unet_index in range(len(mconfig.Unets)):
+            unets.add(Unet(**mconfig.Unets[unet_index].to(device)))
         
         # init decoder
         decoder = Decoder(
-            unet = (unet1, unet2),
+            unet = unets,
             clip = clip,
             **mconfig.Decoder
         ).to(device)

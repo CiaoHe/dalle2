@@ -85,7 +85,7 @@ class ImageDataset(Dataset):
 class VQGanVAETrainer(nn.Module):
     def __init__(
         self,
-        vae,
+        vae:VQGanVAE,
         *,
         num_train_steps,
         lr,

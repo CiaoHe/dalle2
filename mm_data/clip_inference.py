@@ -140,6 +140,7 @@ class OutputSink:
         if self.batch_count == 0:
             return
         self.__write_batch()
+        self.__init_batch()
         
 class NumpyWriter:
     """the numpy writer writes embeddings to folders img_emb, text_emb, and metadata"""

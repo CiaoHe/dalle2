@@ -122,7 +122,6 @@ def get_dataset(dataset:str,
     map_color = dataset in BGRDatasets
     
     tokenizer = None
-    image_transforms = None
     if preprocess_clip_way:
         _, image_transforms = load_clip()
         import clip

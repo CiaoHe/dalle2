@@ -1,23 +1,31 @@
 Unets:
   Unet1:
-    dim: 128
+    dim: 512
     image_embed_dim: 512
     text_embed_dim: 512
-    cond_dim: 128
+    cond_dim: 512
     channels: 3
-    dim_mults: [1, 2, 4, 8] 
+    dim_mults: [1, 2, 3, 4] 
+    cond_on_text_encodings: True
   
   Unet2:
-    dim: 16
+    dim: 320
     image_embed_dim: 512
     text_embed_dim: 512
-    cond_dim: 128
+    cond_dim: 320
     channels: 3
-    dim_mults: [1, 2, 4, 8, 16]
-    cond_on_text_encodings: True
+    dim_mults: [1, 2, 3, 4] 
+  
+  Unet3:
+    dim: 192
+    image_embed_dim: 512
+    text_embed_dim: 512
+    cond_dim: 192
+    channels: 3
+    dim_mults: [1,1,2,2,4,4]
 
 Decoder:
-  image_sizes: [128, 256]
+  image_sizes: [64, 256, 1024]
   timesteps: 1000
   image_cond_drop_prob: 0.1
   text_cond_drop_prob: 0.5
