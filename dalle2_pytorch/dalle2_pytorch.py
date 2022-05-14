@@ -1,4 +1,6 @@
+from calendar import c
 import math
+from statistics import mode
 from typing import Optional 
 from tqdm import tqdm
 from inspect import isfunction
@@ -31,6 +33,10 @@ from rotary_embedding_torch import RotaryEmbedding
 # use x-clip
 from x_clip import CLIP
 from coca_pytorch import CoCa
+
+# constants
+
+NAT = 1. / math.sqrt(2)
 
 # helper functions
 
@@ -89,6 +95,9 @@ def freeze_model_and_make_eval_(model):
     freeze_all_layers_(model)
     
 # tensor helpers
+
+def log(t, eps=1e-12):
+    return torch.log(t.clamp(min=eps))
 
 def l2norm(t):
     return F.normalize(t, p = 2, dim = -1)
@@ -294,6 +303,34 @@ def noise_like(shape, device, repeat=False):
     repeat_noise = lambda: torch.randn((1, *shape[1:]), device=device).repeat(shape[0], *((1,) * (len(shape) - 1)))
     noise = lambda: torch.randn(shape, device=device)
     return repeat_noise() if repeat else noise()
+
+def meanflat(x):
+    return x.mean(dim = tuple(range(1, len(x.shape))))
+
+def normal_kl(mean1, logvar1, mean2, logvar2):
+    return 0.5 * (-1.0 + logvar2 - logvar1 + torch.exp(logvar1 - logvar2) + (mean2 - mean1) ** 2 / torch.exp(logvar2))
+
+def approx_standard_normal_cdf(x):
+    return 0.5 * (1.0 + torch.tanh(((2.0 / math.pi) ** 0.5) * (x + 0.044715 * (x ** 3))))
+
+def discretized_gaussian_log_likelihood(x, *, means, log_sacles, thres=0.999):
+    assert x.shape == means.shape == log_sacles.shape
+    
+    centered_x = x - means
+    inv_stdv = torch.exp(-log_sacles)
+    plus_in = inv_stdv * (centered_x + 1.0 / 255.)
+    cdf_plus = approx_standard_normal_cdf(plus_in)
+    min_in = inv_stdv * (centered_x - 1.0 / 255.)
+    cdf_min = approx_standard_normal_cdf(min_in)
+    log_cdf_plus = log(cdf_plus)
+    log_one_minus_cdf_min = log(1.0 - cdf_min)
+    cdf_dela = cdf_plus - cdf_min
+    
+    log_probs = torch.where(x<-thres,
+                            log_cdf_plus,
+                            torch.where(x>thres, log_one_minus_cdf_min, log(cdf_dela)))
+    return log_probs
+    
 
 def cosine_beta_schedule(timesteps, s = 0.008):
     """
@@ -1200,6 +1237,33 @@ class LinearAttention(nn.Module):
         
         out = self.nonlin(out)
         return self.to_out(out)
+
+class CrossEmbedLayer(nn.Module):
+    def __init__(
+        self,
+        dim_in,
+        kernel_sizes,
+        dim_out = None,
+        stride = 2
+    ):
+        super().__init__()
+        assert all([*map(lambda t: (t % 2) == (stride % 2), kernel_sizes)])
+        dim_out = default(dim_out, dim_in)
+        
+        kernel_sizes = sorted(kernel_sizes)
+        num_scales = len(kernel_sizes)
+        
+        # calculate the dimension at each sacle
+        dim_scales = [int(dim_out / (2 ** i)) for i in range(1, num_scales)]
+        dim_scales = [*dim_scales, dim_out - sum(dim_scales)]
+        
+        self.convs = nn.ModuleList([])
+        for kernel_size, dim_scale in zip(kernel_sizes, dim_scales):
+            self.convs.append(nn.Conv2d(dim_in, dim_scale, kernel_size, stride=stride, padding=(kernel_size - stride) // 2))
+        
+    def forward(self, x):
+        fmaps = tuple(map(lambda conv: conv(x), self.convs))
+        return torch.cat(fmaps, dim = 1)
     
 class Unet(nn.Module):
     def __init__(
@@ -1214,6 +1278,7 @@ class Unet(nn.Module):
         out_dim = None,
         dim_mults = (1, 2, 4, 8),
         channels = 3,
+        channels_out = None,
         attn_dim_head = 32,
         attn_heads = 16,
         lowres_cond = False, # for cascading diffusion - https://cascaded-diffusion.github.io/
@@ -1224,8 +1289,10 @@ class Unet(nn.Module):
         cond_on_image_embeds = False,
         init_dim = None,
         init_conv_kernel_size = 7,
-        block_type = 'resnet',
-        block_resnet_groups = 8,
+        resnet_groups = 8,
+        init_cross_kernel_kernel_sizes = (3, 7, 15),
+        cross_embed_downsample = False,
+        cross_embed_downsample_kernel_sizes = (2, 4),
         **kwargs
     ):
         super().__init__()
@@ -1242,12 +1309,12 @@ class Unet(nn.Module):
         # determine dimensions
         
         self.channels = channels
+        self.channels_out = default(channels_out, channels)
         
         init_channels = channels if not lowres_cond else channels * 2 # in cascading diffusion, one concats the low resolution image, blurred, for conditioning the higher resolution synthesis
         init_dim = default(init_dim, dim//2)
         
-        assert (init_conv_kernel_size % 2) == 1
-        self.init_conv = nn.Conv2d(init_channels, init_dim, init_conv_kernel_size, padding=(init_conv_kernel_size-1)//2, )
+        self.init_conv = CrossEmbedLayer(init_channels, dim_out=init_dim, kernel_sizes=init_cross_kernel_kernel_sizes, stride=1)
         
         dims = [init_dim, *map(lambda m: m*dim, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
@@ -1301,47 +1368,52 @@ class Unet(nn.Module):
         attn_kwargs = dict(heads=attn_heads, dim_head=attn_dim_head,)
         
         # resnet block klass
-        block_klass = partial(ResnetBlock, groups = block_resnet_groups)
+        resnet_groups = cast_tuple(resnet_groups, len(in_out))
+        assert len(resnet_groups) == len(in_out)
+        
+        # downsample klass
+        downsample_klass = Downsample
+        if cross_embed_downsample:
+            downsample_klass = partial(CrossEmbedLayer, kernel_sizes=cross_embed_downsample_kernel_sizes)
         
         # layers
         
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
-        num_resolution = len(in_out)
+        num_resolutions = len(in_out)
         
-        for ind, (dim_in, dim_out) in enumerate(in_out):
+        for ind, ((dim_in, dim_out), groups) in enumerate(zip(in_out, resnet_groups)):
             is_first = ind == 0
-            is_last = ind == num_resolution - 1
+            is_last = ind == num_resolutions - 1
             layer_cond_dim = cond_dim if not is_first else None
             
             self.downs.append(nn.ModuleList([
-                block_klass(dim_in, dim_out, time_cond_dim = time_cond_dim,),
+                ResnetBlock(dim_in, dim_out, time_cond_dim = time_cond_dim, groups=groups),
                 Residual(LinearAttention(dim_out, **attn_kwargs)) if sparse_attn else nn.Identity(),
-                block_klass(dim_out, dim_out, cond_dim = layer_cond_dim, time_cond_dim = time_cond_dim,),
+                ResnetBlock(dim_out, dim_out, cond_dim = layer_cond_dim, time_cond_dim = time_cond_dim, groups=groups),
                 Downsample(dim_out) if not is_last else nn.Identity()
             ]))
             
         mid_dim = dims[-1]
 
-        self.mid_block1 = block_klass(mid_dim, mid_dim, cond_dim = cond_dim, time_cond_dim = time_cond_dim)
+        self.mid_block1 = ResnetBlock(mid_dim, mid_dim, cond_dim = cond_dim, time_cond_dim = time_cond_dim, groups = resnet_groups[-1])
         self.mid_attn = EinopsToAndFrom('b c h w', 'b (h w) c', Residual(Attention(mid_dim, **attn_kwargs))) if attend_at_middle else None
-        self.mid_block2 = block_klass(mid_dim, mid_dim, cond_dim = cond_dim, time_cond_dim = time_cond_dim)
+        self.mid_block2 = ResnetBlock(mid_dim, mid_dim, cond_dim = cond_dim, time_cond_dim = time_cond_dim, groups = resnet_groups[-1])
         
-        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
-            is_last = ind == num_resolution - 1
+        for ind, ((dim_in, dim_out), groups) in enumerate(zip(reversed(in_out[1:]), reversed(resnet_groups))):
+            is_last = ind >= (num_resolutions - 2)
             layer_cond_dim = cond_dim if not is_last else None
             
             self.ups.append(nn.ModuleList([
-                block_klass(dim_out * 2, dim_in, cond_dim = layer_cond_dim, time_cond_dim = time_cond_dim,),
+                ResnetBlock(dim_out * 2, dim_in, cond_dim = layer_cond_dim, time_cond_dim = time_cond_dim, groups = groups),
                 Residual(LinearAttention(dim_in, **attn_kwargs)) if sparse_attn else nn.Identity(),
-                block_klass(dim_in, dim_in, cond_dim = layer_cond_dim, time_cond_dim = time_cond_dim,),
-                Upsample(dim_in)  
+                ResnetBlock(dim_in, dim_in, cond_dim = layer_cond_dim, time_cond_dim = time_cond_dim, groups = groups),
+                Upsample(dim_in)
             ]))
         
-        out_dim = default(out_dim, channels)
         self.final_conv = nn.Sequential(
-            block_klass(dim, dim),
-            nn.Conv2d(dim, out_dim, 1)
+            ResnetBlock(dim, dim, groups=resnet_groups[0]),
+            nn.Conv2d(dim, self.channels_out, 1)
         )
         
     # if the current settings for the unet are not correct
@@ -1351,12 +1423,24 @@ class Unet(nn.Module):
         *,
         lowres_cond:bool,
         channels,
-        cond_on_image_embeds:bool
+        channels_out,
+        cond_on_image_embeds:bool,
+        cond_on_text_encodings:bool,
     ):
-        if lowres_cond == self.lowres_cond and cond_on_image_embeds == self.cond_on_image_embeds and channels == self.channels:
+        if lowres_cond == self.lowres_cond and \
+            channels == self.channels and \
+            cond_on_image_embeds == self.cond_on_image_embeds and \
+            cond_on_text_encodings == self.cond_on_text_encodings and \
+            channels_out == self.channels_out:
             return self
         
-        updated_kwargs = {'lowres_cond': lowres_cond, 'channels': channels, 'cond_on_image_embeds': cond_on_image_embeds}
+        updated_kwargs = dict(
+            lowres_cond = lowres_cond,
+            channels = channels,
+            channels_out = channels_out,
+            cond_on_image_embeds = cond_on_image_embeds,
+            cond_on_text_encodings = cond_on_text_encodings
+        )
         return self.__class__(**{**self._locals, **updated_kwargs})
     
     def forward_with_cond_scale(
@@ -1559,7 +1643,10 @@ class Decoder(BaseGaussianDiffusion):
         condition_on_text_encodings = False,        # the paper suggested that this didn't do much in the decoder, but i'm allowing the option for experimentation 
         clip_denoised = True,
         clip_x_start = True,
-        clip_adapter_overrides = dict()
+        clip_adapter_overrides = dict(),
+        learned_variance = True,
+        vb_loss_weight = 0.001,
+        unconditional = False,
     ):
         super().__init__(
             beta_schedule=beta_schedule,
@@ -1567,6 +1654,9 @@ class Decoder(BaseGaussianDiffusion):
             loss_type=loss_type,
         )
         
+        self.un_conditional = unconditional
+        assert not (condition_on_text_encodings and unconditional), 'unconditional decoder image generation cannot be set to True if conditioning on text is present'
+
         assert exists(clip) ^ exists(image_size), 'either CLIP is supplied, or you must give the image_size and channels (usually 3 for RGB)'
         
         self.clip = None
@@ -1594,10 +1684,16 @@ class Decoder(BaseGaussianDiffusion):
         unets = cast_tuple(unet)
         vaes = pad_tuple_to_length(cast_tuple(vae), len(unets), fillvalue=NullVQGanVAE(channels=self.channels))
         
+        # whether to use learned variance, defaults to True for the first unet in the cascades
+        learned_variance = pad_tuple_to_length(cast_tuple(learned_variance), len(unets), fillvalue=False)
+        self.learned_variance = learned_variance
+        self.vb_loss_weight = vb_loss_weight
+        
+        # construct unets and vaes
         self.unets = nn.ModuleList([])
         self.vaes = nn.ModuleList([])
         
-        for ind, (one_unet, one_vae) in enumerate(zip(unets, vaes)):
+        for ind, (one_unet, one_vae, one_unet_learned_var) in enumerate(zip(unets, vaes, learned_variance)):
             assert isinstance(one_unet, Unet), f"unet must be an Unet, not {type(one_unet)}"
             assert isinstance(one_vae, (NullVQGanVAE, VQGanVAE)), f"vae must be a VQGanVAE(or NullOne), not {type(one_vae)}"
             
@@ -1605,11 +1701,14 @@ class Decoder(BaseGaussianDiffusion):
             latent_dim = one_vae.encoded_dim if exists(one_vae) else None
             
             unet_channels = default(latent_dim, self.channels) # if use latent_diffusion(vae), cast channels to laetent_dim
+            unet_channels_out = unet_channels * (1 if not one_unet_learned_var else 2)
             
             one_unet = one_unet.cast_model_parameters(
                 lowres_cond = not is_first,
                 channels = unet_channels,
-                cond_on_image_embeds = is_first,
+                channels_out = unet_channels_out,
+                cond_on_image_embeds = is_first and not unconditional,
+                cond_on_text_encodings=one_unet.cond_on_text_encodings and not unconditional,
             )
             
             self.unets.append(one_unet)
@@ -1675,8 +1774,13 @@ class Decoder(BaseGaussianDiffusion):
     def p_mean_variance(self, unet:Unet, 
                         x, t, image_embed, text_encodings = None, text_mask = None,
                         lowres_cond_img = None, clip_denoised = True, predict_x_start = False,
-                        cond_scale = 1.0):
-        pred = unet.forward_with_cond_scale(x, t, image_embed = image_embed, text_encodings = text_encodings, text_mask = text_mask, lowres_cond_img = lowres_cond_img, cond_scale = cond_scale)
+                        cond_scale = 1.0, learned_variance=False, model_output=None):
+        pred = default(model_output, 
+                       lambda: unet.forward_with_cond_scale(x, t, image_embed = image_embed, text_encodings = text_encodings, text_mask = text_mask, lowres_cond_img = lowres_cond_img, cond_scale = cond_scale)
+                       )
+        
+        if learned_variance:
+            pred, var_interp_frac_unnormalized = pred.chunk(2, dim=1)
 
         if predict_x_start:
             x_recon = pred
@@ -1687,15 +1791,30 @@ class Decoder(BaseGaussianDiffusion):
             x_recon.clamp_(-1, 1)
             
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_recon, x, t)
+        
+        if learned_variance:
+            # if learned variance, posterio variance and posterior log variance are predicted by the network
+            # by an interpolation of the max and min log beta values
+            # eq 15 - https://arxiv.org/abs/2102.09672
+            min_log = extract(self.posterior_log_variance_clipped, t, x.shape)
+            max_log = extract(torch.log(self.betas), t, x.shape)
+            var_interp_frac = unnomarlize_img(var_interp_frac_unnormalized)
+            
+            posterior_log_variance = (1 - var_interp_frac) * min_log + var_interp_frac * max_log
+            posterior_variance = torch.exp(posterior_log_variance)
+        
         return model_mean, posterior_variance, posterior_log_variance
     
     @torch.inference_mode()
     def p_sample(self, unet:Unet,
                 x, t, image_embed, text_encodings = None, text_mask = None,
                 lowres_cond_img = None, clip_denoised = True, predict_x_start = False,
-                cond_scale = 1.0, repeat_noise = False):
+                learned_variance = False, cond_scale = 1.0, repeat_noise = False):
         b, *_, device = *x.shape, x.device
-        model_mean, _, model_log_variance = self.p_mean_variance(unet, x, t, image_embed, text_encodings, text_mask, lowres_cond_img, clip_denoised, predict_x_start, cond_scale)
+        model_mean, _, model_log_variance = self.p_mean_variance(
+            unet = unet, x=x, t=t, image_embed=image_embed, text_encodings = text_encodings, text_mask = text_mask,
+            cond_scale=cond_scale, lowres_cond_img = lowres_cond_img, clip_denoised = clip_denoised, predict_x_start = predict_x_start, learned_variance=learned_variance
+        )
         noise = noise_like(x.shape, device, repeat=repeat_noise)
         # no noise when t == 0
         nonzero_mask = (1 - (t==0).float()).reshape(b, *((1,) * (len(x.shape)-1)))
@@ -1703,7 +1822,8 @@ class Decoder(BaseGaussianDiffusion):
     
     @torch.inference_mode()
     def p_sample_loop(self, unet:Unet, shape, image_embed, 
-                      predict_x_start = False, clip_denoised = True, lowres_cond_img = None, cond_scale = 1.0,
+                      predict_x_start = False, clip_denoised = True, learned_variance=False,
+                      lowres_cond_img = None, cond_scale = 1.0,
                       text_encodings = None, text_mask = None,):
         device = self.betas.device
         
@@ -1721,6 +1841,7 @@ class Decoder(BaseGaussianDiffusion):
                 lowres_cond_img=lowres_cond_img,
                 clip_denoised=clip_denoised,
                 predict_x_start=predict_x_start,
+                learned_variance=learned_variance,
                 cond_scale=cond_scale,
             )
         
@@ -1728,12 +1849,12 @@ class Decoder(BaseGaussianDiffusion):
     
     def p_losses(self, unet:Unet,
                  x_start, times, *, image_embed, lowres_cond_img = None, text_encodings = None, text_mask = None,
-                 predict_x_start = False, clip_denoised = True, noise = None):
+                 predict_x_start = False, clip_denoised = True, noise = None, learned_variance=False):
         noise = default(noise, torch.randn_like(x_start))
         
         x_noisy = self.q_sample(x_start=x_start, t=times, noise=noise)
         
-        pred = unet(
+        model_output = unet(
             x_noisy,
             times,
             image_embed = image_embed,
@@ -1744,10 +1865,44 @@ class Decoder(BaseGaussianDiffusion):
             text_cond_drop_prob = self.text_cond_drop_prob,
         )
         
+        if learned_variance:
+            pred, _ = model_output.chunk(2, dim=1)
+        else:
+            pred = model_output
+        
         target = noise if not predict_x_start else x_start
         
         loss = self.loss_fn(pred, target)
-        return loss
+        
+        if not learned_variance:
+            # return simple loss if not using learned variance
+            return loss
+        
+        # if learning the variance, also include the extra weight kl loss
+        true_mean, _, true_log_variance_clipped = self.q_posterior(x_start=x_start, x_t=x_noisy, t=times)
+        model_mean, _, model_log_variance = self.p_mean_variance(
+            unet, x=x_noisy, t=times, image_embed=image_embed, clip_denoised=clip_denoised, 
+            learned_variance=True, model_output=model_output 
+        )
+        
+        # kl loss with detached model predicted mean, for stability reasons as in paper
+        detached_model_mean = model_mean.detach()
+        
+        kl = normal_kl(true_mean, true_log_variance_clipped, detached_model_mean, model_log_variance)
+        kl = meanflat(kl) * NAT
+        
+        decoder_nll = -discretized_gaussian_log_likelihood(x_start, means=detached_model_mean,
+                                                           log_sacles=0.5*model_log_variance)
+        decoder_nll = meanflat(decoder_nll) * NAT
+        
+        # at the first timestep return the decoder NLL, otherwise return KL(q(x_{t-1}|x_t,x_0) || p(x_{t-1}|x_t))
+        vb_losses = torch.where(times == 0, decoder_nll, kl)
+        
+        # weight the vb loss smaller, for stability, as in the paper (recommended 0.001)
+        vb_loss = vb_losses.mean() * self.vb_loss_weight
+
+        return loss + vb_loss
+        
     
     @torch.inference_mode()
     @eval_decorator
@@ -1769,13 +1924,14 @@ class Decoder(BaseGaussianDiffusion):
         
         img = None
         
-        for unet_number, unet, vae, channel, image_size, predict_x_start in tqdm(zip(
+        for unet_number, unet, vae, channel, image_size, predict_x_start, learned_variance in tqdm(zip(
             range(1, len(self.unets)+1),
             self.unets,
             self.vaes,
             self.sample_channels,
             self.image_sizes,
-            self.predict_x_start
+            self.predict_x_start,
+            self.learned_variance,
         )):
             unet: Unet
             vae: Optional(VQGanVAE, NullVQGanVAE)
@@ -1802,6 +1958,7 @@ class Decoder(BaseGaussianDiffusion):
                     image_embed = image_embed,
                     predict_x_start=predict_x_start,
                     clip_denoised=not is_latent_diffusion,
+                    learned_variance=learned_variance,
                     lowres_cond_img=lowres_cond_img,
                     cond_scale=cond_scale,
                     text_encodings=text_encodings,
@@ -1833,6 +1990,7 @@ class Decoder(BaseGaussianDiffusion):
         target_image_size = self.image_sizes[unet_index]
         predict_x_start   = self.predict_x_start[unet_index]
         random_crop_size  = self.random_crop_sizes[unet_index]
+        learned_variance = self.learned_variance[unet_index]
         b,c,h,w,device    = *image.shape, image.device
         
         check_shape(image, 'b c h w', c = self.channels)
@@ -1871,7 +2029,7 @@ class Decoder(BaseGaussianDiffusion):
             if exists(lowres_cond_img):
                 lowres_cond_img = vae.encode(lowres_cond_img)
         
-        return self.p_losses(unet, x_start=image, times = times, image_embed = image_embed, lowres_cond_img = lowres_cond_img, text_encodings = text_encodings, text_mask = text_mask, predict_x_start = predict_x_start)
+        return self.p_losses(unet, x_start=image, times = times, image_embed = image_embed, lowres_cond_img = lowres_cond_img, text_encodings = text_encodings, text_mask = text_mask, predict_x_start = predict_x_start, learned_variance = learned_variance)
     
 # main class
 
