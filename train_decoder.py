@@ -154,15 +154,17 @@ def train(trainer:DecoderTrainer, train_dl, val_dl, cfg, device):
     # NEED automatically create log/ckpt dir
     if not os.path.exists(cfg.wandb_dir):
         os.makedirs(cfg.wandb_dir, exist_ok=True)
-    wandb.init(
-        project=cfg.wandb_project, 
-        config = {
+    wandb_config = {
             'lr': cfg.learning_rate,
             'wd': cfg.weight_decay,
             'max_gradient_clipping_norm': cfg.max_gradient_clipping_norm,
             'batch_size': cfg.batch_size,
             'num_epochs': cfg.epochs,
-        }.update(**cfg.mconfig),
+        }
+    wandb_config.update(**cfg.mconfig)
+    wandb.init(
+        project=cfg.wandb_project, 
+        config = wandb_config,
         dir = cfg.wandb_dir,
     )
     
@@ -196,7 +198,7 @@ def train(trainer:DecoderTrainer, train_dl, val_dl, cfg, device):
                 loss_log[f"Training loss - Unet{unet_number}"] = loss.item()
                 
             # Log to wandb
-            wandb.log(loss_log.update({"step": step})) 
+            wandb.log(loss_log) 
             
             # eval time - sample
             if step > 0 and step % cfg.eval_interval == 0:
@@ -297,9 +299,10 @@ def main():
                                         load_clip=not args.clip == "openai_clip", clip=clip)
     else:
         # init unets
-        unets = ()
-        for unet_index in range(len(mconfig.Unets)):
-            unets.add(Unet(**mconfig.Unets[unet_index].to(device)))
+        unets = []
+        for unet_name in mconfig.Unets:
+            unets.append(Unet(**mconfig.Unets[unet_name]).to(device))
+        unets = tuple(unets)
         
         # init decoder
         decoder = Decoder(

@@ -1805,7 +1805,7 @@ class Decoder(BaseGaussianDiffusion):
             # by an interpolation of the max and min log beta values
             # eq 15 - https://arxiv.org/abs/2102.09672
             min_log = extract(self.posterior_log_variance_clipped, t, x.shape)
-            max_log = extract(torch.log(self.betas), t, x.shape)
+            max_log = extract(log(self.betas), t, x.shape)
             var_interp_frac = unnormalize_zero_to_one(var_interp_frac_unnormalized)
             
             posterior_log_variance = (1 - var_interp_frac) * min_log + var_interp_frac * max_log
