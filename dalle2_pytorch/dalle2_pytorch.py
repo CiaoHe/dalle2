@@ -316,7 +316,7 @@ def meanflat(x):
     return x.mean(dim = tuple(range(1, len(x.shape))))
 
 def normal_kl(mean1, logvar1, mean2, logvar2):
-    return 0.5 * (-1.0 + logvar2 - logvar1 + torch.exp(logvar1 - logvar2) + (mean2 - mean1) ** 2 / torch.exp(logvar2))
+    return 0.5 * (-1.0 + logvar2 - logvar1 + torch.exp(logvar1 - logvar2) + (mean2 - mean1) ** 2 / torch.exp(-logvar2))
 
 def approx_standard_normal_cdf(x):
     return 0.5 * (1.0 + torch.tanh(((2.0 / math.pi) ** 0.5) * (x + 0.044715 * (x ** 3))))
@@ -1916,6 +1916,11 @@ class Decoder(BaseGaussianDiffusion):
         
         # weight the vb loss smaller, for stability, as in the paper (recommended 0.001)
         vb_loss = vb_losses.mean() * self.vb_loss_weight
+        
+        if torch.isnan(vb_loss):
+            print('vb loss is nan')
+            import pdb
+            pdb.set_trace()
 
         return loss + vb_loss
         
