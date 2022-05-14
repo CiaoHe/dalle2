@@ -4,7 +4,7 @@ from statistics import mode
 from typing import Optional 
 from tqdm import tqdm
 from inspect import isfunction
-from functools import partial
+from functools import partial, wraps
 from contextlib import contextmanager
 from collections import namedtuple
 
@@ -45,6 +45,14 @@ def exists(val):
 
 def identity(t, *args, **kwargs):
     return t
+
+def maybe(fn):
+    @wraps(fn)
+    def inner(x):
+        if not exists(x):
+            return x
+        return fn(x)
+    return inner
 
 def default(val, d):
     if exists(val):
@@ -116,10 +124,10 @@ def resize_image_to(image, target_image_size):
 # ddpm expect images to be normalized to [-1, 1]
 # but CLIP may otherwise be used with images in [0, 1]
 
-def normalize_img(img):
+def normalize_neg_one_to_one(img):
     return (img - 0.5) * 2
 
-def unnomarlize_img(img):
+def unnormalize_zero_to_one(img):
     return img / 2 + 0.5
 
 # clip related adapters
@@ -278,7 +286,7 @@ class OpenAIClipAdapter(BaseClipAdapter):
     def embed_image(self, image):
         assert not self.cleared, 'image embedding should be called before text embedding'
         image = resize_image_to(image, self.image_size)
-        image = self.clip_normalize(unnomarlize_img(image))
+        image = self.clip_normalize(image)
         image_embed = self.clip.encode_image(image)
         return EmbeddedImage(l2norm(image_embed.float()), None)
     
@@ -1798,7 +1806,7 @@ class Decoder(BaseGaussianDiffusion):
             # eq 15 - https://arxiv.org/abs/2102.09672
             min_log = extract(self.posterior_log_variance_clipped, t, x.shape)
             max_log = extract(torch.log(self.betas), t, x.shape)
-            var_interp_frac = unnomarlize_img(var_interp_frac_unnormalized)
+            var_interp_frac = unnormalize_zero_to_one(var_interp_frac_unnormalized)
             
             posterior_log_variance = (1 - var_interp_frac) * min_log + var_interp_frac * max_log
             posterior_variance = torch.exp(posterior_log_variance)
@@ -1829,6 +1837,7 @@ class Decoder(BaseGaussianDiffusion):
         
         b = shape[0]
         img = torch.randn(shape, device=device)
+        lowres_cond_img = maybe(normalize_neg_one_to_one)(lowres_cond_img)
         
         for i in tqdm(reversed(range(self.num_timesteps)), desc='decoder unet sampling loop time step', total=self.num_timesteps):
             img = self.p_sample(
@@ -1845,13 +1854,20 @@ class Decoder(BaseGaussianDiffusion):
                 cond_scale=cond_scale,
             )
         
-        return img
+        unnormalize_img = unnormalize_zero_to_one(img)
+        return unnormalize_img
     
     def p_losses(self, unet:Unet,
                  x_start, times, *, image_embed, lowres_cond_img = None, text_encodings = None, text_mask = None,
                  predict_x_start = False, clip_denoised = True, noise = None, learned_variance=False):
         noise = default(noise, torch.randn_like(x_start))
         
+        # normalize to [-1, 1] for x_start(image)
+        x_start = normalize_neg_one_to_one(x_start)
+        
+        lowres_cond_img = maybe(normalize_neg_one_to_one)(lowres_cond_img)
+        
+        # get x_t
         x_noisy = self.q_sample(x_start=x_start, t=times, noise=noise)
         
         model_output = unet(
