@@ -1,5 +1,7 @@
 import copy
+from math import ceil
 from functools import partial
+from collections.abc import Iterable
 from pathlib import Path
 import time
 
@@ -14,6 +16,9 @@ from dalle2_pytorch.optimizer import get_optimizer
 
 def exists(val):
     return val is not None
+
+def default(val, d):
+    return val if exists(val) else d
 
 def cast_tuple(val, length = 1):
     return val if isinstance(val, tuple) else ((val,) * length)
@@ -40,6 +45,47 @@ def groupby_prefix_and_trim(prefix, d):
     kwargs_with_prefix, kwargs = group_dict_by_key(partial(string_begins_with, prefix), d)
     kwargs_without_prefix = dict(map(lambda x: (x[0][len(prefix):], x[1]), tuple(kwargs_with_prefix.items())))
     return kwargs_without_prefix, kwargs
+
+# gradient accumulation functions
+
+def split_iterable(it, split_size):
+    accum = []
+    for ind in range(ceil(len(it) / split_size)):
+        start_index = ind * split_size
+        accum.append(it[start_index: (start_index + split_size)])
+    return accum
+
+def split(t, split_size):
+    if not exists(split_size):
+        return t
+    
+    if isinstance(t, torch.Tensor):
+        return t.split(split_size, dim=0)
+    
+    if isinstance(t, Iterable):
+        return split_iterable(t, split_size)
+    
+    return TypeError
+
+def split_args_and_kwargs(x, *args, split_size=None, **kwargs):
+    batch_size = len(x)
+    split_size = default(split_size, batch_size)
+    chunk_size = ceil(batch_size / split_size)
+    
+    dict_len = len(kwargs)
+    dict_keys = kwargs.keys()
+    all_args = (x, *args, *kwargs.values())
+    len_all_args = len(all_args)
+    split_kwargs_index = len_all_args - dict_len
+    
+    split_all_args = [split(arg, split_size=split_size) if exists(arg) and isinstance(arg, (torch.Tensor, Iterable)) else ((arg,) * chunk_size) for arg in all_args]
+    chunk_sizes = tuple(map(len, split_all_args[0]))
+    
+    for (chunk_size, *chunked_all_args) in tuple(zip(chunk_sizes, *split_all_args)):
+        chunked_args, chunked_kwargs_values = chunked_all_args[:split_kwargs_index], chunked_all_args[split_kwargs_index:]
+        chunked_kwargs = dict(tuple(zip(dict_keys, chunked_kwargs_values)))
+        chunk_size_frac = chunk_size / batch_size
+        yield chunk_size_frac, (chunked_args, chunked_kwargs)
 
 # print helpers
 
@@ -94,7 +140,7 @@ def save_diffusion_model(save_path, model, optimizer, scaler, config, image_embe
 # exponential moving average wrapper
 
 class EMA(nn.Module):
-    def __init__(self, model, beta = 0.999, update_after_step=1000, update_every=10):
+    def __init__(self, model, beta = 0.9999, update_after_step=1000, update_every=10):
         super().__init__()
         self.online_model = model
         self.beta = beta
@@ -148,7 +194,7 @@ class DiffusionPriorTrainer(nn.Module):
         self,
         diffusion_prior,
         use_ema = True,
-        lr = 3e-4,
+        lr = 2e-5,
         wd = 1e-2,
         max_grad_norm = None,
         amp = False,
@@ -204,10 +250,17 @@ class DiffusionPriorTrainer(nn.Module):
     def sample_batch_size(self, *args, **kwargs):
         return self.ema_diffusion_prior.ema_model.sample_batch_size(*args, **kwargs)
     
-    def forward(self, *args, divsior=1, **kwargs):
-        with autocast(enabled=self.amp):
-            loss = self.diffusion_prior(*args, **kwargs)
-        return self.scaler.scale(loss / divsior)
+    def forward(self, x, *args, max_batch_size = None, **kwargs):
+        total_loss = 0.
+        
+        for chunk_size_frac, (chunked_args, chunked_kwargs) in split_args_and_kwargs(x, *args, split_size=max_batch_size, **kwargs):
+            with autocast(enabled=self.amp):
+                loss = self.diffusion_prior(*chunked_args, **chunked_kwargs)
+                loss = loss * chunk_size_frac
+                
+            total_loss += loss.item()
+            self.scaler.scale(loss).backward()
+        return total_loss
     
 # decoder trainer
 
@@ -216,7 +269,7 @@ class DecoderTrainer(nn.Module):
         self,
         decoder,
         use_ema = True,
-        lr = 3e-4,
+        lr = 2e-5,
         wd = 1e-2,
         max_grad_norm = None,
         amp = False,
@@ -314,9 +367,16 @@ class DecoderTrainer(nn.Module):
         x,
         *,
         unet_number,
-        divisor = 1,
+        max_batch_size = None,
         **kwargs
     ):
-        with autocast(enabled=self.amp):
-            loss = self.decoder(x, unet_number = unet_number, **kwargs)
-        return self.scale(loss/divisor, unet_number = unet_number)
+        total_loss = 0.
+        
+        for chunk_size_frac, (chunked_args, chunked_kwargs) in split_args_and_kwargs(x, split_size=max_batch_size, **kwargs):
+            with autocast(enabled=self.amp):
+                loss = self.decoder(*chunked_args, unet_number = unet_number, **chunked_kwargs)
+                loss = loss * chunk_size_frac
+                
+            total_loss += loss.item()
+            self.scale(loss, unet_number = unet_number).backward()
+        return total_loss 

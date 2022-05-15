@@ -195,10 +195,9 @@ def train(trainer:DecoderTrainer, train_dl, val_dl, cfg, device):
             for unet_index in range(len(trainer.decoder.unets)):
                 unet_number = unet_index + 1
                 loss = trainer(image, text=text, unet_number=unet_number)
-                loss.backward()
                 
                 trainer.update(unet_number)
-                loss_log[f"Training loss - Unet{unet_number}"] = loss.item()
+                loss_log[f"Training loss - Unet{unet_number}"] = loss
                 
             # Log to wandb
             wandb.log(loss_log) 
@@ -320,7 +319,7 @@ def main():
         lr = args.learning_rate,
         wd = args.weight_decay,
         max_grad_norm=args.max_grad_norm,
-        ema_beta = 0.99,
+        ema_beta = 0.9999,
         ema_update_after_step = args.ema_update_after_step,
         ema_update_every = args.ema_update_every,
         amp = args.amp,

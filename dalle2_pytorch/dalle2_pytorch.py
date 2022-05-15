@@ -608,7 +608,6 @@ class Attention(nn.Module):
         heads = 8,
         dropout = 0.,
         causal = False,
-        post_norm = False,
         rotary_emb = None
     ):
         super().__init__()
@@ -618,7 +617,6 @@ class Attention(nn.Module):
         
         self.causal = causal
         self.norm = LayerNorm(dim)
-        self.post_norm = LayerNorm(dim) # sandwich norm from Coqview paper + Normformer
         self.dropout = nn.Dropout(dropout)
         
         self.null_kv = nn.Parameter(torch.randn(2, dim_head))
@@ -629,7 +627,7 @@ class Attention(nn.Module):
         
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim, bias=False),
-            LayerNorm(dim) if post_norm else nn.Identity(),
+            LayerNorm(dim),
         )
     
     def forward(self, x, mask=None, attn_bias=None):
@@ -685,8 +683,7 @@ class Attention(nn.Module):
         out = einsum('b h i j, b j d -> b h i d', attn, v)
         
         out = rearrange(out, 'b h n d -> b n (h d)')
-        out = self.to_out(out)
-        return self.post_norm(out)
+        return self.to_out(out)
     
 class CausalTransformer(nn.Module):
     def __init__(
@@ -712,7 +709,7 @@ class CausalTransformer(nn.Module):
         self.layers = nn.ModuleList([])
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                Attention(dim=dim, dim_head=dim_head, heads=heads, dropout=attn_dropout, causal=True, post_norm=normformer, rotary_emb=rotary_emb),
+                Attention(dim=dim, dim_head=dim_head, heads=heads, dropout=attn_dropout, causal=True, rotary_emb=rotary_emb),
                 FeedForward(dim=dim, mult=ff_mult, dropout=ff_dropout, post_activation_norm=normformer),
             ]))
         
@@ -1141,6 +1138,7 @@ class CrossAttention(nn.Module):
         dim_head = 64,
         heads = 8,
         dropout = 0.,
+        norm_context = False,
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -1150,13 +1148,16 @@ class CrossAttention(nn.Module):
         context_dim = default(context_dim, dim)
         
         self.norm = LayerNorm(dim)
-        self.norm_context = LayerNorm(context_dim)
+        self.norm_context = LayerNorm(context_dim) if norm_context else nn.Identity()
         self.dropout = nn.Dropout(dropout)
         
         self.null_kv = nn.Parameter(torch.randn(2, dim_head))
         self.to_q = nn.Linear(dim, inner_dim, bias=False)
         self.to_kv = nn.Linear(context_dim, inner_dim * 2, bias=False)
-        self.to_out = nn.Linear(inner_dim, dim, bias=False)
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim, bias = False),
+            LayerNorm(dim)
+        )
         
     def forward(self, x, context, mask = None):
         b, n, device = *x.shape[:2], x.device
@@ -1351,6 +1352,9 @@ class Unet(nn.Module):
             nn.Linear(image_embed_dim, cond_dim * num_image_tokens),
             Rearrange('b (r d) -> b r d', r = num_image_tokens),
         ) if image_embed_dim != cond_dim else nn.Identity()
+        
+        self.norm_cond = nn.LayerNorm(cond_dim)
+        self.norm_mid_cond = nn.LayerNorm(cond_dim)
         
         # text encoding conditioning (optional)
         
@@ -1553,6 +1557,11 @@ class Unet(nn.Module):
         # text and image conditioning tokens (mid_c)
         # to save on compute, only do cross attention based conditioning on the inner most layers of the Unet (mid_block)
         mid_c = c if not exists(text_tokens) else torch.cat((c, text_tokens), dim = -2)
+        
+        # normalize conditioning tokens
+        
+        c = self.norm_cond(c)
+        mid_c = self.norm_mid_cond(mid_c)
         
         # go through the layers of the unet, down and up
         
