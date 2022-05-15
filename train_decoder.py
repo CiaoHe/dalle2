@@ -162,6 +162,7 @@ def train(trainer:DecoderTrainer, train_dl, val_dl, cfg, device):
             'wd': cfg.weight_decay,
             'max_gradient_clipping_norm': cfg.max_gradient_clipping_norm,
             'batch_size': cfg.batch_size,
+            'max_batch_size': cfg.max_batch_size,
             'num_epochs': cfg.epochs,
         }
     wandb_config.update(**cfg.mconfig)
@@ -194,7 +195,7 @@ def train(trainer:DecoderTrainer, train_dl, val_dl, cfg, device):
             
             for unet_index in range(len(trainer.decoder.unets)):
                 unet_number = unet_index + 1
-                loss = trainer(image, text=text, unet_number=unet_number)
+                loss = trainer(image, text=text, unet_number=unet_number, max_batch_size=cfg.max_batch_size)
                 
                 trainer.update(unet_number)
                 loss_log[f"Training loss - Unet{unet_number}"] = loss
@@ -239,6 +240,7 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--batch-size", type=int, default=10**4)
+    parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--num-epochs", type=int, default=5)
     parser.add_argument("--amp", type=bool, default=False)
     parser.add_argument("--cond-scale", type=float, default=1.0)
@@ -264,6 +266,7 @@ def main():
         "weight_decay":args.weight_decay,
         "max_gradient_clipping_norm":args.max_grad_norm,
         "batch_size":args.batch_size,
+        "max_batch_size":args.max_batch_size,
         "eval_batch_size":args.eval_batch_size,
         "eval_interval":args.eval_interval,
         "epochs": args.num_epochs,
