@@ -5,6 +5,7 @@ from pathlib import Path
 import time
 from omegaconf import OmegaConf
 from tqdm import tqdm
+import copy
 
 import wandb
 os.environ["WANDB_SILENT"] = "true"
@@ -114,11 +115,12 @@ def load_decoder_model(path, device, load_clip=False, clip=None):
     ).to(device)
     
     # Loader from ckpt
-    decoder.load_state_dict(loaded_obj['decoder'])
+    decoder.load_state_dict(loaded_obj['decoder'], strict=False)
     return decoder
 
 def save_decoder_model(save_path, decoder:Decoder, clip, hparams, step):
     # avoid save decoder's clip
+    decoder = copy.deepcopy(decoder)
     if exists(decoder.clip):
         del decoder.clip
     # Saving State Dict
@@ -128,10 +130,11 @@ def save_decoder_model(save_path, decoder:Decoder, clip, hparams, step):
         hparams = hparams,
     )
     if exists(clip):
-        state_dict['clip'] = {
-            'ModelType': clip.__class__.__name__,
-            'weights': clip.state_dict(),
-        }
+        if clip.__class__.__name__ != "OpenAIClipAdapter":
+            state_dict['clip'] = {
+                'ModelType': clip.__class__.__name__,
+                'weights': clip.state_dict(),
+            }
     torch.save(state_dict, save_path+'/'+str(step)+'_saved_model.pth')
     print_ribbon('Saved checkpoint to '+save_path+'/'+str(step)+'_saved_model.pth')
     
