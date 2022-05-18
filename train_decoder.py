@@ -321,7 +321,7 @@ def main():
         lr = args.learning_rate,
         wd = args.weight_decay,
         max_grad_norm=args.max_grad_norm,
-        ema_beta = 0.9999,
+        ema_beta = 0.99,
         ema_update_after_step = args.ema_update_after_step,
         ema_update_every = args.ema_update_every,
         amp = args.amp,
